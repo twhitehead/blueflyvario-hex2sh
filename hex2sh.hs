@@ -17,7 +17,7 @@ import System.Environment as SE
 data HFLine =
   HFValues
   { hfLineAddrL :: Word16
-  , hfLineData :: Vector Word8 } |
+  , hfLineData :: Vector Word32 } |
   HFUpper
   { hfLineAddrU :: Word16 } |
   HFEOF
@@ -32,32 +32,48 @@ hfCheck :: MonadPlus m => Parsing m => Bool -> String -> m ()
 hfCheck True  _ = return ()
 hfCheck False e = mzero <?> e
 
--- Parse n hex letters and return accumulated sum ((... (h_{n-1})*16 ... + h_2)*16 + h_1)*16 + h_0
+-- Parse a Word8 expressed in hexadecimal and return it
 --
--- "10"     2 -> 0x10
--- "598c00" 6 -> 0x598c00
-hfHexLetters :: CharParsing m => Int -> m Integer
-hfHexLetters n = Prelude.foldl accumulator 0 <$> digits <?> (show n Prelude.++ " hex letters")
+-- "10" -> 0x10
+-- "2f" -> 0x2f
+hfHexWord8 :: CharParsing m => m Word8
+hfHexWord8 = (\d1 d0 -> d1*16+d0) <$> digit <*> digit <?> "hex word8"
   where
-    accumulator s d = s*16 + d
-    digits = count n (toInteger . digitToInt <$> hexDigit)
+    digit = (fromIntegral . digitToInt) <$> hexDigit
 
--- Parse n hex bytes and return vector of them
+-- Parse a Word16 expressed in little-endian hexadecimal and return it
 --
--- "10"     1 -> fromList [0x10]
--- "598c00" 3 -> fromList [0x59,0x8c,0x00]
-hfHexVector :: CharParsing m => Int -> m (Vector Word8)
-hfHexVector n = fromList <$> count n (fromIntegral <$> hfHexLetters 2) <?> ((show n) Prelude.++ " two digit hex letters")
+-- "1023" -> 0x2310
+-- "2fd1" -> 0xd12f
+hfHexWord16LE :: CharParsing m => m Word16
+hfHexWord16LE = (\d0 d1 -> d1*256+d0) <$> digit <*> digit <?> "hex little-endian word16"
+  where
+    digit = fromIntegral <$> hfHexWord8
+
+-- Parse a Word16 expressed in big-endian hexadecimal and return it
+--
+-- "1023" -> 0x1023
+-- "2fd1" -> 0x2fd1
+hfHexWord16BE :: CharParsing m => m Word16
+hfHexWord16BE = (\d1 d0 -> d1*256+d0) <$> digit <*> digit <?> "hex big-endian word16"
+  where
+    digit = fromIntegral <$> hfHexWord8
+
+-- Parse a Word32 expressed in little-endian hexadecimal and return it
+--
+-- "102368af" -> 0xaf682310
+-- "2fd12107" -> 0x0721d12f
+hfHexWord32LE :: CharParsing m => m Word32
+hfHexWord32LE = (\d0 d1 -> d1*65536+d0) <$> digit <*> digit <?> "hex little-endian word32"
+  where
+    digit = fromIntegral <$> hfHexWord16LE
 
 -- Verify checksum (sum `mod` 256 == 0) of a hex dump line without consuming it (no leading ':')
 --
 -- "020000040000fa" -> True
 -- "020000040000fb" -> False
 hfLineCSum :: LookAheadParsing m => CharParsing m => m Bool
-hfLineCSum = (== 0) <$> lookAhead (Prelude.foldr (+) 0 <$> some word8) <?> "line checksum"
-  where
-    word8 :: CharParsing m => m Word8
-    word8 = fromIntegral <$> hfHexLetters 2
+hfLineCSum = (== 0) <$> lookAhead (Prelude.foldr (+) 0 <$> some hfHexWord8) <?> "line checksum"
 
 -- Parse any end-of-line
 --
@@ -83,14 +99,15 @@ hfLine = do
   okay           <- hfLineCSum
   hfCheck okay "hex bytes should sum to 0 mod 256"
 
-  values_length  <- hfHexLetters 2
-  address_lower  <- hfHexLetters 4
-  command        <- hfHexLetters 2
+  values_length  <- fromIntegral <$> hfHexWord8
+  address_lower  <- fromIntegral <$> hfHexWord16BE
+  command        <- fromIntegral <$> hfHexWord8
 
   hfline         <-
     case command of
       0 -> do
-        values <- hfHexVector (fromIntegral values_length)
+        hfCheck (values_length `rem` 4 == 0) "length should be multiple of 4 for 32 bit LE data"
+        values <- fromList <$> count (values_length `quot` 4) hfHexWord32LE
         return $ HFValues (fromIntegral address_lower) values
 
       1 -> do
@@ -100,12 +117,12 @@ hfLine = do
       4 -> do
         hfCheck (address_lower == 0) "upper address type should have zero address"
         hfCheck (values_length == 2) "upper address type should have data length 2"
-        address_upper <- hfHexLetters 4
+        address_upper <- hfHexWord16BE
         return $ HFUpper (fromIntegral address_upper)
 
       _ -> mzero <?> ("unsupported type code " Prelude.++ show command)
 
-  hfHexLetters 2
+  hfHexWord8
 
   hfEOL <?> "line should end after checksum"
 
