@@ -7,7 +7,7 @@ module Main where
 
 import Data.Char as DC
 import Data.Word as DW
-import Data.Vector as DV
+import Data.List as DL
 import Text.Trifecta as TT
 import Text.Parser.LookAhead as TPL
 import Control.Monad as CM
@@ -15,14 +15,13 @@ import Control.Applicative as CA
 import System.Environment as SE
 
 data HFLine =
-  HFValues
+  HFLine
   { hfLineAddrL :: Word16
-  , hfLineData :: Vector Word32 } |
+  , hfLineData :: [Word32] } |
   HFUpper
   { hfLineAddrU :: Word16 } |
   HFEOF
   deriving (Show)
-
 
 -- Fail with given error message if condition doesn't hold
 --
@@ -88,8 +87,7 @@ hfEOL = do
 -- Parse a hex dump line
 --
 -- ":10598c009e007800040078000bef0700446b800049"
---                   -> HFValues $ fromList [0x9e,0x00,0x78,0x00,0x04,0x00,0x78,0x00,
---                                           0x0b,0xef,0x07,0x00,0x44,0x6b,0x80,0x00]
+--                   -> HFLine 0x598c $ fromList [0x0078009e,0x00780004,0x0007ef0b,0x00806b44]
 -- ":00000001FF"     -> HFEOF
 -- ":0200000401f009" -> HFUpper 0x01f0
 hfLine :: MonadPlus m => LookAheadParsing m => CharParsing m => m HFLine
@@ -99,16 +97,16 @@ hfLine = do
   okay           <- hfLineCSum
   hfCheck okay "hex bytes should sum to 0 mod 256"
 
-  values_length  <- fromIntegral <$> hfHexWord8
-  address_lower  <- fromIntegral <$> hfHexWord16BE
-  command        <- fromIntegral <$> hfHexWord8
+  values_length  <- hfHexWord8
+  address_lower  <- hfHexWord16BE
+  command        <- hfHexWord8
 
   hfline         <-
     case command of
       0 -> do
         hfCheck (values_length `rem` 4 == 0) "length should be multiple of 4 for 32 bit LE data"
-        values <- fromList <$> count (values_length `quot` 4) hfHexWord32LE
-        return $ HFValues (fromIntegral address_lower) values
+        values <- count (fromIntegral values_length `quot` 4) hfHexWord32LE
+        return $ HFLine (fromIntegral address_lower) values
 
       1 -> do
         hfCheck (values_length == 0) "EOF type should have data length 0"
@@ -128,10 +126,77 @@ hfLine = do
 
   return hfline
 
+-- Parse hex file to 32-bit address value pairs
+--
+-- ":0200000401f009\n" -- HFUpper 0x01f0
+-- ":10598c009e007800040078000bef0700446b800049\n"
+--                     -- HFLine 0x598c [0x0078009e,0x00780004,0x0007ef0b,0x00806b44]
+-- ":00000001FF\n"     -- HFEOF
+--   -> [(0x01f0598c,0x0078009e),(0x01f05990,0x00780004),(0x01f05994,0x0007ef0b),(0x01f05998,0x00806b44)]
+--
+hfParse :: MonadPlus m => LookAheadParsing m => CharParsing m => m [(Word32,Word32)]
+hfParse =  concat <$> doit 0
+    where
+      doit address_upper = do
+        line <- hfLine
+        case line of
+          HFLine  address_lower code -> (:) <$> pure (addressAdd address_upper address_lower code) <*> doit address_upper
+          HFUpper address_upper'     -> doit address_upper'
+          HFEOF                      -> eof *> pure []
+      addressAdd address_upper address_lower instructions =
+          zipWith (\index instruction -> (address + index*4,instruction)) [0..] instructions
+              where
+                address = fromIntegral address_upper * 0x10000 + fromIntegral address_lower
+
+-- Sort [(address,value)] by address
+--
+-- [(0x01f0598c,0x00780004),(0x01f05990,0x0078009e),(0x01f0598c,0x0007ef0b)]
+--   -> [(0x01f0598c,0x00780004),(0x01f0598c,0x0007ef0b),(0x01f05990,0x0078009e)]
+--
+sparsevaluesSort :: [(Word32,Word32)] -> [(Word32,Word32)]
+sparsevaluesSort = sortOn fst
+
+-- Overwrite early address with later ones in sorted [(address,value)]
+--
+-- [(0x01f0598c,0x00780004),(0x01f0598c,0x0007ef0b),(0x01f05990,0x0078009e)]
+--   -> [(0x01f0598c,0x0007ef0b),(0x01f05990,0x0078009e)]
+--
+sparsevaluesOverwrite :: [(Word32,Word32)] -> [(Word32,Word32)]
+sparsevaluesOverwrite = map last . groupBy (\(address0,_) (address1,_) -> address0 == address1)
+
+
+-- Group [(address,value)] into chunks sizes according to flash row size
+--
+-- 16 -> [(0x01f0598c,0x0078009e),(0x01f05990,0x00780004),(0x01f05994,0x0007ef0b),(0x01f05998,0x00806b44)]
+--   ->  [[(0x01f0598c,0x0078009e)],[(0x01f05990,0x00780004),(0x01f05994,0x0007ef0b),(0x01f05998,0x00806b44)]]
+--
+sparsevaluesGroupRows :: Word32 -> [(Word32,Word32)] -> [[(Word32,Word32)]]
+sparsevaluesGroupRows chunk = groupBy (\(address0,_) (address1,_) -> address0 `quot` chunk == address1 `quot` chunk)
+
+-- Convert [(address,value)] chunks into (address,[(offset,value])
+--
+-- 16 -> [(0x01f05990,0x00780004),(0x01f05994,0x0007ef0b),(0x01f05998,0x00806b44)]
+--   -> (0x01f05990,[(0x0,0x00780004),(0x4,0x0007ef0b),(0x8,0x00806b44)])
+addressoffsetvaluesFromSparseValues :: Word32 -> [(Word32,Word32)] -> (Word32,[(Word32,Word32)])
+addressoffsetvaluesFromSparseValues chunk address_values = (address_base,offset_values)
+    where
+      address_base = fst (head address_values) `quot` chunk * chunk
+      offset_values = map (\(address,values) -> (address `rem` chunk,values)) address_values
+
+-- Convert (address,[(offset,value)]) chunk to (address,[value]) by inserting default value
+--
+-- 16 -> 0x00ffffff -> (0x01f05990,[(0x0,0x00780004),(0x4,0x0007ef0b),(0x8,0x00806b44)])
+--   -> (0x01f05990,[0x00780004,0x0007ef0b,0x00806b44,0x00ffffff])
+addressvaluesFromAddressOffsetValues :: Word32 -> Word32 -> (Word32,[(Word32,Word32)]) -> (Word32,[Word32])
+addressvaluesFromAddressOffsetValues chunk value_default (address,offsetvalues)
+    = (address,(map snd . sparsevaluesOverwrite . sparsevaluesSort) (offsetvalues_default ++ offsetvalues))
+    where
+      offsetvalues_default = zip [0,4..chunk-1] (repeat value_default)
+
 
 main :: IO ()
 main = do
   [file] <- getArgs
-  result <- parseFromFile (many hfLine) file
-  print result
-
+  result <- parseFromFile hfParse file
+  print (map (addressvaluesFromAddressOffsetValues 128 0xffffff . addressoffsetvaluesFromSparseValues 128) .
+         sparsevaluesGroupRows 128 . sparsevaluesOverwrite . sparsevaluesSort <$> result)
