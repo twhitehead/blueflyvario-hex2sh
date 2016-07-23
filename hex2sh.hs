@@ -193,10 +193,34 @@ addressvaluesFromAddressOffsetValues chunk value_default (address,offsetvalues)
     where
       offsetvalues_default = zip [0,4..chunk-1] (repeat value_default)
 
+-- Convert (address,[value]) to write command
+--
+-- (0x01f05990,[0x00 78 00 04,0x00 07 ef 0b,0x00 80 6b 44,0x00 ff ff ff])
+--   -> [0xf8,0x2c,0xc8, 0x01, 0x0d, 0x78,0x04,0x00, 0x07,0x0b,0xef, 0x80,0x44,0x6b, 0xff,0xff,0xff, 0x5d]
+writecommandFromAddressValues :: (Word32,[Word32]) -> [Word8]
+writecommandFromAddressValues (address,values) = commandbytes ++ [checksumbyte]
+    where
+      valuebytesFromValue :: Word32 -> [Word8]
+      valuebytesFromValue value = [v2,v0,v1]  -- Have no idea why ds30loader organizes it this way
+          where
+            v2 = fromIntegral $ (value `quot` 0x10000) `rem` 0x100
+            v1 = fromIntegral $ (value `quot`   0x100) `rem` 0x100
+            v0 = fromIntegral $ (value `quot`     0x1) `rem` 0x100
+      addressbytes = [a2, a1, a0]
+          where
+            a = address `quot` 2              -- Memory is parallel 8 and 16 bit memories index by later
+            a2 = fromIntegral $ (a `quot` 0x10000) `rem` 0x100
+            a1 = fromIntegral $ (a `quot`   0x100) `rem` 0x100
+            a0 = fromIntegral $ (a `quot`     0x1) `rem` 0x100
+      valuesbytes = concatMap valuebytesFromValue values
+      lengthbyte = fromIntegral $ length valuesbytes + 1
+      commandbytes = addressbytes ++ [0x02,lengthbyte] ++ valuesbytes
+      checksumbyte = - sum commandbytes
+
 
 main :: IO ()
 main = do
   [file] <- getArgs
   result <- parseFromFile hfParse file
-  print (map (addressvaluesFromAddressOffsetValues 128 0xffffff . addressoffsetvaluesFromSparseValues 128) .
-         sparsevaluesGroupRows 128 . sparsevaluesOverwrite . sparsevaluesSort <$> result)
+  print (map (writecommandFromAddressValues . addressvaluesFromAddressOffsetValues 128 0xffffff . addressoffsetvaluesFromSparseValues 128) .
+             sparsevaluesGroupRows 128 . sparsevaluesOverwrite . sparsevaluesSort <$> result)
