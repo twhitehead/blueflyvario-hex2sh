@@ -213,21 +213,14 @@ addresscommandFromAddressValues (address,values) = (address `quot` 2,commandbyte
       commandbytes = addressbytes ++ [0x02,lengthbyte] ++ valuesbytes
       checksumbyte = - sum commandbytes
 
-main :: IO ()
-main = do
-  [file] <- getArgs
-  mparse <- parseFromFile hfParse file
-  case mparse of
-    Just parse -> putStr ( programFromAddressCommands .
-                           map (addresscommandFromAddressValues .
-                                addressvaluesFromAddressOffsetValues 128 0xffffff .
-                                addressoffsetvaluesFromSparseValues 128) .
-                           sparsevaluesGroupRows 128 .
-                           sparsevaluesOverwrite .
-                           sparsevaluesSort $ parse )
-    _           -> return ()
-
-
+-- Convert [(address,command)] to sh script to send commands to ds30loader
+--
+-- (0x01f05990,[0xf8,0x2c,0xc8, 0x01, 0x0d, 0x78,0x04,0x00, 0x07,0x0b,0xef, 0x80,0x44,0x6b, 0xff,0xff,0xff, 0x5d])
+--   -> ...
+--
+-- - commands are sent using "echo -ne" with hex escape encoding as this is 8 bit clean (can handle 0x00)
+-- - responses are recieved by piping through "od" (earlier hexdump) to convert to hex strings
+-- - the "script" program is required to ensure "od" is running in line buffering mode (allocates a terminal)
 programFromAddressCommands :: [(Word32,[Word8])] -> String
 programFromAddressCommands addresscommands = program
     where
@@ -329,3 +322,22 @@ programFromAddressCommands addresscommands = program
                 "stty 57600 pass8 raw <&3\n" ++
                 "\n" ++
                 "script -c \"od -tx1 -w1 -v\" /dev/null <&3 | main >&3\n"
+
+-- Main routine
+--
+-- runhaskell hex2hs.hs <input hex file> > <output shell script>
+main :: IO ()
+main = do
+  [file] <- getArgs
+  mparse <- parseFromFile hfParse file
+  case mparse of
+    Just parse -> putStr ( programFromAddressCommands .
+                           map (addresscommandFromAddressValues .
+                                addressvaluesFromAddressOffsetValues 128 0xffffff .
+                                addressoffsetvaluesFromSparseValues 128) .
+                           sparsevaluesGroupRows 128 .
+                           sparsevaluesOverwrite .
+                           sparsevaluesSort $ parse )
+    _           -> return ()
+
+
