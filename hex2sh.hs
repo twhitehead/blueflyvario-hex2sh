@@ -1,10 +1,6 @@
 module Main where
---
--- hex file -> hex file internal
--- hex file internal -> memory internal
--- memory internal -> flash commands
---
 
+import Text.Printf
 import Data.Char as DC
 import Data.Word as DW
 import Data.List as DL
@@ -193,12 +189,12 @@ addressvaluesFromAddressOffsetValues chunk value_default (address,offsetvalues)
     where
       offsetvalues_default = zip [0,4..chunk-1] (repeat value_default)
 
--- Convert (address,[value]) to write command
+-- Convert (address,[value]) to (address,command)
 --
 -- (0x01f05990,[0x00 78 00 04,0x00 07 ef 0b,0x00 80 6b 44,0x00 ff ff ff])
---   -> [0xf8,0x2c,0xc8, 0x01, 0x0d, 0x78,0x04,0x00, 0x07,0x0b,0xef, 0x80,0x44,0x6b, 0xff,0xff,0xff, 0x5d]
-writecommandFromAddressValues :: (Word32,[Word32]) -> [Word8]
-writecommandFromAddressValues (address,values) = commandbytes ++ [checksumbyte]
+--   -> (0x01f05990,[0xf8,0x2c,0xc8, 0x01, 0x0d, 0x78,0x04,0x00, 0x07,0x0b,0xef, 0x80,0x44,0x6b, 0xff,0xff,0xff, 0x5d])
+addresscommandFromAddressValues :: (Word32,[Word32]) -> (Word32,[Word8])
+addresscommandFromAddressValues (address,values) = (address `quot` 2,commandbytes ++ [checksumbyte])
     where
       valuebytesFromValue :: Word32 -> [Word8]
       valuebytesFromValue value = [v2,v0,v1]  -- Have no idea why ds30loader organizes it this way
@@ -217,10 +213,119 @@ writecommandFromAddressValues (address,values) = commandbytes ++ [checksumbyte]
       commandbytes = addressbytes ++ [0x02,lengthbyte] ++ valuesbytes
       checksumbyte = - sum commandbytes
 
-
 main :: IO ()
 main = do
   [file] <- getArgs
-  result <- parseFromFile hfParse file
-  print (map (writecommandFromAddressValues . addressvaluesFromAddressOffsetValues 128 0xffffff . addressoffsetvaluesFromSparseValues 128) .
-             sparsevaluesGroupRows 128 . sparsevaluesOverwrite . sparsevaluesSort <$> result)
+  mparse <- parseFromFile hfParse file
+  case mparse of
+    Just parse -> putStr ( programFromAddressCommands .
+                           map (addresscommandFromAddressValues .
+                                addressvaluesFromAddressOffsetValues 128 0xffffff .
+                                addressoffsetvaluesFromSparseValues 128) .
+                           sparsevaluesGroupRows 128 .
+                           sparsevaluesOverwrite .
+                           sparsevaluesSort $ parse )
+    _           -> return ()
+
+
+programFromAddressCommands :: [(Word32,[Word8])] -> String
+programFromAddressCommands addresscommands = program
+    where
+      programFromAddressCommand (address,command) = "  program \"" ++ printf "0x%06x" address ++ "\" \"" ++ concatMap (printf "\\x%02x") command ++ "\"\n"
+      program = "#!/bin/sh\n" ++
+                "\n" ++
+                "log () {\n" ++
+                "  echo \"$1\" >&2\n" ++
+                "}\n" ++
+                "\n" ++
+                "die () {\n" ++
+                "  log \"$2\"\n" ++
+                "  exit \"$1\"\n" ++
+                "}\n" ++
+                "\n" ++
+                "program() {\n" ++
+                "  local try\n" ++
+                "  local offset\n" ++
+                "  local response\n" ++
+                "\n" ++
+                "  log \"Programming row $1...\"\n" ++
+                "  try=0\n" ++
+                "  while [ \"$try\" -lt 60 ]; do\n" ++
+                "    try=$(($try+1))\n" ++
+                "    [ \"$try\" -gt 1 ] && log \"Resending row $row (attempt $try of 60)...\"\n" ++
+                "    echo -ne \"$2\"\n" ++
+                "    read -t 1 offset response || continue\n" ++
+                "    break\n" ++
+                "  done\n" ++
+                "\n" ++
+                "  [ $try -ge 60 ] && die 1 \"Reached maximium row resend attempts...\"\n" ++
+                "\n" ++
+                "  if [ \"$response\" = \"4b\" ]; then    # K - Okay\n" ++
+                "    :\n" ++
+                "  elif [ \"$response\" = \"4e\" ]; then  # N - Checksum error\n" ++
+                "    die 1 \"Received checksum error from ds30loader...\"\n" ++
+                "  elif [ \"$response\" = \"56\" ]; then  # V - Verification failure\n" ++
+                "    log \"Row verification failure reported by ds30loader...\"\n" ++
+                "  elif [ \"$response\" = \"50\" ]; then  # P - Boot loader protection\n" ++
+                "    log \"Row skipped by ds30loader due to boot loader protection...\"\n" ++
+                "  elif [ \"$response\" = \"55\" ]; then  # U - Unknown command\n" ++
+                "    die 1 \"Received unknown command error from ds30loader...\"\n" ++
+                "  else\n" ++
+                "    die 1 \"Received unknown response code $response from ds30loader...\"\n" ++
+                "  fi\n" ++
+                "}\n" ++
+                "\n" ++
+                "main() {\n" ++
+                "  local try\n" ++
+                "  local offset\n" ++
+                "  local response\n" ++
+                "  local response0\n" ++
+                "  local response1\n" ++
+                "  local response2\n" ++
+                "  local response3\n" ++
+                "  local device_number\n" ++
+                "  local version_major\n" ++
+                "  local version_minor\n" ++
+                "  local version_revision\n" ++
+                "\n" ++
+                "  log \"Establishing communication with ds30loader...\"\n" ++
+                "\n" ++
+                "  try=0\n" ++
+                "  while [ \"$try\" -lt 60 ]; do\n" ++
+                "    try=$(($try+1))\n" ++
+                "    [ \"$try\" -gt 1 ] && log \"Reattempting communication establishment (attempt $try of 60)...\"\n" ++
+                "\n" ++
+                "    while read -t 1 offset response; do\n" ++
+                "      :\n" ++
+                "    done\n" ++
+                "\n" ++
+                "    echo -ne '\\xc1'\n" ++
+                "    read -t 1 offset response0 || continue\n" ++
+                "    read -t 1 offset response1 || continue\n" ++
+                "    read -t 1 offset response2 || continue\n" ++
+                "    read -t 1 offset response3 || continue\n" ++
+                "\n" ++
+                "    [ \"$response3\" = \"4b\" ] || continue\n" ++
+                "\n" ++
+                "    break\n" ++
+                "  done\n" ++
+                "\n" ++
+                "  [ \"$try\" -ge 60 ] && die 1 \"Unable to establish communication with ds30loader...\"\n" ++
+                "\n" ++
+                "  device_number=$((0x$response2/0x80*0x200 + 0x$response1/0x80*0x100 +  0x$response0))\n" ++
+                "  version_major=$((0x$response1%0x80))\n" ++
+                "  version_minor=$((0x$response2/0x10%0x10))\n" ++
+                "  version_revision=$((0x$response2%0x10))\n" ++
+                "\n" ++
+                "  log\n" ++
+                "  log \"PIC Device = $device_number\"\n" ++
+                "  log \"ds30loader = $version_major.$version_minor.$version_revision\"\n" ++
+                "  log\n" ++
+                "\n" ++
+                concatMap programFromAddressCommand addresscommands ++
+                "}\n" ++
+                "\n" ++
+                "exec 3<>/dev/ttymxc0\n" ++
+                "stty 57600 pass8 raw <&3\n" ++
+                "\n" ++
+                "script -c \"od -tx1 -w1 -v\" /dev/null <&3 | main >&3\n"
